@@ -1,5 +1,4 @@
 import os
-
 import torch
 import torchvision
 from torch import nn
@@ -13,81 +12,83 @@ import pdb
 import matplotlib.pyplot as plt
 import argparse
 import torch.nn.functional as F
+import inception_tf
+import fid
+import os.path as osp
 
 class vae(nn.Module):
-    def __init__(self, nz = 20):
+    def __init__(self, nz = 128):
         super(vae, self).__init__()
         self.nz = nz
         self.have_cuda = True
+        self.device = 'cuda'
         self.encoder = nn.Sequential(
-            nn.Conv2d(nc, ndf, 4, 2, 1, bias=False), # 16 x 16
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False), # 8 x 8
-            nn.BatchNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 2, ndf * 4, 3, 2, 1, bias=False), # 4 x 4
-            nn.BatchNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 4, 1024, 4, 1, 0, bias=False), # 1 x 1
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(nc, ngf, kernel_size=2, stride=2), # 16x16
+            nn.ReLU(),
+            nn.Conv2d(ngf, ngf*2, kernel_size=2, stride=2), # 8x8
+            nn.ReLU(),
+            nn.Conv2d(ngf*2, ngf*4, kernel_size=2, stride=2), # 4x4
+            nn.ReLU(),
+            nn.Conv2d(ngf*4, ngf*8, kernel_size=2, stride=2), # 2x2
+            nn.ReLU(),
+            nn.Conv2d(ngf*8, ngf*16, kernel_size=2, stride=2), # 1x1
+            nn.ReLU(),
         )
 
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(1024, ngf * 8, 4, 1, 0, bias=False), # 4 x 4
-            nn.BatchNorm2d(ngf * 8),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(ngf * 8, ngf * 4, 3, 2, 1, bias=False), # 7 x 7
-            nn.BatchNorm2d(ngf * 4),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False), # 14 x 14
-            nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(ngf * 2, nc, 6, 2, 0, bias=False), # 32 x 32
-            nn.Sigmoid()
+            nn.ConvTranspose2d(ndf*16, ndf*8, kernel_size=2, stride=2), # 2x2
+            nn.ReLU(),
+            nn.ConvTranspose2d(ndf*8, ndf*4, kernel_size=2, stride=2), # 4x4
+            nn.ReLU(),
+            nn.ConvTranspose2d(ndf*4, ndf*2, kernel_size=2, stride=2), # 8x8
+            nn.ReLU(),
+            nn.ConvTranspose2d(ndf*2, ndf, kernel_size=2, stride=2), # 16x16
+            nn.ReLU(),
+            nn.ConvTranspose2d(ndf, nc, kernel_size=2, stride=2), # 32x32
+            nn.Tanh(),
         )
 
-        self.fc1 = nn.Linear(1024, 512)
-        self.fc21 = nn.Linear(512, nz)
-        self.fc22 = nn.Linear(512, nz)
-
-        self.fc3 = nn.Linear(nz, 512)
-        self.fc4 = nn.Linear(512, 1024)
-
-        self.lrelu = nn.LeakyReLU()
-        self.relu = nn.ReLU()
-
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        self.fc1 = nn.Linear(1024, nz)
+        self.fc2 = nn.Linear(1024, nz)
+        self.fc3 = nn.Linear(nz, 1024)
+        
+        self.best_is = 0
+        self.best_fid = 0
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=1e-5)
         
     def loss_fn(self, recon_x, x, mu, logvar):
-        BCE = F.binary_cross_entropy(recon_x.view(-1, 32*32), x.view(-1, 32*32), size_average=False)
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + 3 * KLD, BCE, KLD
+        BCE = nn.MSELoss(size_average=False)(recon_x, x)/x.size(0)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())/x.size(0)
+        return BCE + KLD, BCE, KLD
+
+    def reparameterize(self, mu, logvar):
+        std = logvar.mul(0.5).exp_()
+        # return torch.normal(mu, std)
+        esp = torch.randn(*mu.size())
+        z = mu + std * esp.cuda()
+        return z
+    
+    def bottleneck(self, h):
+        mu, logvar = self.fc1(h), self.fc2(h)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
 
     def encode(self, x):
-        conv = self.encoder(x);
-        h1 = self.fc1(conv.view(-1, 1024))
-        return self.fc21(h1), self.fc22(h1)
+        h = self.encoder(x)
+        h = h.view(-1, 1024)
+        z, mu, logvar = self.bottleneck(h)
+        return z, mu, logvar
 
     def decode(self, z):
-        h3 = self.relu(self.fc3(z))
-        deconv_input = self.fc4(h3)
-        deconv_input = deconv_input.view(-1,1024,1,1)
-        return self.decoder(deconv_input)
-
-    def reparametrize(self, mu, logvar):
-        std = logvar.mul(0.5).exp_()
-        if self.have_cuda:
-            eps = torch.cuda.FloatTensor(std.size()).normal_()
-        else:
-            eps = torch.FloatTensor(std.size()).normal_()
-        eps = Variable(eps)
-        return eps.mul(std).add_(mu)
+        z = self.fc3(z)
+        z = self.decoder(z.view(-1,1024,1,1))
+        return z
 
     def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparametrize(mu, logvar)
-        decoded = self.decode(z)
-        return decoded, mu, logvar
+        z, mu, logvar = self.encode(x)
+        z = self.decode(z)
+        return z, mu, logvar
     
     def log(self, message):
         print(message)
@@ -95,7 +96,44 @@ class vae(nn.Module):
         fh.write(message + '\n')
         fh.close()
         
-        
+    def compute_inception_score(self, samples):
+        IS_mean, IS_std = inception_tf.get_inception_score(np.array(samples), splits=10,
+                                                           batch_size=100, mem_fraction=1)
+        print('Inception score: {} +/- {}'.format(IS_mean, IS_std))
+        return IS_mean, IS_std
+
+    def compute_fid(self, samples):
+        fid_score = fid.compute_fid(osp.join(inception_cache_path, 'stats.npy'), samples,
+                                    inception_cache_path, dataloader)
+        print('FID score: {}'.format(fid_score))
+        return fid_score
+    
+    def compute_inception_fid(self):
+        samples = []
+        num_batches = int(50000 / batch_size)
+        for batch in range(num_batches):
+            with torch.no_grad():
+                z = torch.randn(batch_size, self.nz, device=self.device)
+                gen = self.decode(z)
+                gen = gen * 0.5 + 0.5
+                gen = gen * 255.0
+                gen = gen.cpu().numpy().astype(np.uint8)
+                gen = np.transpose(gen, (0, 2, 3, 1))
+                samples.extend(gen)
+
+        IS_mean, IS_std = self.compute_inception_score(samples)
+        fid = self.compute_fid(samples)
+        self.log('IS: {} +/- {}'.format(IS_mean, IS_std))
+        self.log('FID: {}'.format(fid))
+        if self.best_is < IS_mean:
+            self.best_is = IS_mean
+            self.best_is_std = IS_std
+            self.best_fid = fid
+        if self.best_fid > fid:
+            self.best_fid = fid
+        self.log('Best IS: {} +/- {}'.format(self.best_is, self.best_is_std))
+        self.log('Best FID: {}'.format(self.best_fid))    
+            
     def save(self, model_path):
         self.log(f'Saving vae as {model_path}')
         model_state = {}
@@ -197,7 +235,7 @@ class vae(nn.Module):
     def train(self, prune, init_state, init_with_old):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
         if not prune:
-            self.save('./mnist/before_train.pth')
+            self.save('./cifar/before_train.pth')
         
         if prune and init_with_old:
             self.load(init_state)
@@ -214,13 +252,14 @@ class vae(nn.Module):
                 if prune:
                     self.mask()
 
-            self.log("Epoch[{}/{}] Loss: {} BCE: {} KL: {}".format(epoch+1, 
-                                    num_epochs, loss.data.item()/batch_size, bce.data.item()/batch_size, kld.data.item()/batch_size))
+            self.log("Epoch[{}/{}] Loss: {} Recon: {} KL: {}".format(epoch+1, 
+                                    num_epochs, loss.data.item(), bce.data.item(), kld.data.item()))
             if epoch % 10 == 0 or epoch == num_epochs - 1:
+                self.compute_inception_fid()
                 #save_image(torch.cat((output, img), 0) * 0.5 + 0.5, './cifar/image_{}.png'.format(epoch))
                 sample, mu, logvar = self.forward(test_input.cuda())
-                save_image(sample, path + '/image_{}.png'.format(epoch))
-        
+                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))
+    
         torch.save(self.state_dict(), path + '/vae.pth')
 
 num_epochs = 100
@@ -230,33 +269,36 @@ learning_rate = 1e-3
 img_transform = transforms.Compose([
             transforms.Resize(32),
             transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
+            transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
         ])
 
-#dataset = CIFAR10('../datasets/cifar', download=True, transform=img_transform)
-dataset = MNIST('../datasets/mnist', download=True, transform=img_transform)
+dataset = CIFAR10('../datasets/cifar', download=True, transform=img_transform)
+#dataset = MNIST('../datasets/mnist', download=True, transform=img_transform)
 dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-ngf = 128
-ndf = 128
-nc = 1
+ngf = 64
+ndf = 64
+nc = 3
        
 test_input, classes = next(iter(dataloader1)) 
 print(classes)
-    
-path = './mnist_80'
-init_state = './mnist/before_train.pth'
-trained_original_model_state = './mnist/vae.pth'
+
+inception_cache_path = './inception_cache/cifar'
+path = './cifar'
+init_state = './cifar/before_train.pth'
+trained_original_model_state = './cifar/vae.pth'
 init_with_old = True
 
 fh = open(path + "/train.log", 'w')
 fh.write('Logging')
 fh.close()
 
+inception_tf.initialize_inception()
+
 model = vae().cuda()
-model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-model.train(prune = True, init_state = init_state, init_with_old = init_with_old)
+#model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
+model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
 '''
 model.iterative_prune(init_state = init_state, 
                     trained_original_model_state = trained_original_model_state, 
