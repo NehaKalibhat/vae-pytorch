@@ -141,13 +141,19 @@ class vae(nn.Module):
         model_state['optimizer'] = self.optimizer.state_dict()
         torch.save(model_state, model_path)
         
-    def load(self, model_path):
+    def load(self, model_path, prune_encoder = True, prune_decoder = True):
         self.log(f'Loading saved vae named {model_path}') 
         model_state = torch.load(model_path)
-        self.load_state_dict(model_state['vae'])
+        new_state = {}
+        for name in model_state['vae']:
+            if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                new_state[name] = model_state['vae'][name]
+            else:
+                new_state[name] = self.state_dict()[name]
+        self.load_state_dict(new_state)
         self.optimizer.load_state_dict(model_state['optimizer'])
     
-    def one_shot_prune(self, pruning_perc, layer_wise = False, trained_original_model_state = None):
+    def one_shot_prune(self, pruning_perc, prune_encoder = True, prune_decoder = True, layer_wise = False, trained_original_model_state = None):
         self.log(f"************pruning {pruning_perc} of the network****************")
         self.log(f"Layer-wise pruning = {layer_wise}")
         model = None
@@ -167,17 +173,18 @@ class vae(nn.Module):
             total = 0
             self.log("VAE layer-wise pruning percentages")
             for name in model:
-                #if "weight" in name:
-                weight_copy = model[name].data.abs().clone()
-                threshold = global_threshold
-                if layer_wise:
-                    layer_weights = model[name].data.cpu().numpy()
-                    threshold = np.percentile(abs(layer_weights), pruning_perc)
-                mask = weight_copy.gt(threshold).int()
-                self.log(f'{name} : {mask.numel() - mask.nonzero().size(0)} / {mask.numel()}  {(mask.numel() - mask.nonzero().size(0))/mask.numel()}')
-                zeros += mask.numel() - mask.nonzero().size(0)
-                total += mask.numel()
-                masks[name] = mask
+                if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                    threshold = global_threshold
+                    if layer_wise:
+                        layer_weights = model[name].data.cpu().numpy()
+                        threshold = np.percentile(abs(layer_weights), pruning_perc)
+                    masks[name] = model[name].gt(threshold).int()
+                    pruned = masks[name].numel() - masks[name].nonzero().size(0)
+                    tot = masks[name].numel()
+                    frac = pruned / tot
+                    self.log(f"{name} : {pruned} / {tot}  {frac}")
+                    zeros += pruned
+                    total += tot
             self.log(f"Fraction of weights pruned = {zeros}/{total} = {zeros/total}")
             self.masks = masks
     
@@ -202,7 +209,9 @@ class vae(nn.Module):
                         trained_original_model_state, 
                         number_of_iterations, 
                         percent = 20, 
-                        init_with_old = True):
+                        init_with_old = True,
+                        prune_encoder = True,
+                        prune_decoder = True):
         
         
         weight_fractions = self.get_weight_fractions(number_of_iterations, percent)       
@@ -215,30 +224,41 @@ class vae(nn.Module):
             if pruning_iter != 0:
                 trained_model = path + "/"+ "end_of_" + str(pruning_iter - 1) + '.pth'
             
-            self.one_shot_prune(weight_fractions[pruning_iter], trained_original_model_state = trained_model)
-            model.train(prune = True, init_state = init_state, init_with_old = init_with_old)
+            self.one_shot_prune(weight_fractions[pruning_iter], 
+                                trained_original_model_state = trained_model, 
+                                prune_encoder = prune_encoder,
+                                prune_decoder = prune_decoder)
+            self.train(prune = True, 
+                       init_state = init_state, 
+                       init_with_old = init_with_old,
+                       prune_encoder = prune_encoder,
+                       prune_decoder = prune_decoder)
+            
             torch.save(self.state_dict(), path + "/"+ "end_of_" + str(pruning_iter) + '.pth')
             
             sample, mu, logvar = self.forward(test_input.cuda())
-            save_image(sample, path + '/image_' + str(pruning_iter) + '.png')
-
+            save_image(sample * 0.5 + 0.5, path + '/image_' + str(pruning_iter) + '.png')
+            torch.cuda.empty_cache()
+            
         self.log("Finished Iterative Pruning")
         
         
-    def mask(self):
+    def mask(self, prune_encoder = True, prune_decoder = True):
         model = self.state_dict()
         for name in model:
-            #if "weight" in name:
-            model[name].data.mul_(self.masks[name])
+            if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                model[name].data.mul_(self.masks[name])
         self.load_state_dict(model)
     
-    def train(self, prune, init_state, init_with_old):
+    def train(self, prune, init_state, init_with_old, prune_encoder = True, prune_decoder = True):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
         if not prune:
-            self.save('./cifar/before_train.pth')
+            self.save(path + '/before_train.pth')
         
         if prune and init_with_old:
-            self.load(init_state)
+            self.load(init_state, 
+                      prune_encoder = prune_encoder,
+                      prune_decoder = prune_decoder)
         
         for epoch in range(num_epochs):
             for data in dataloader:
@@ -250,30 +270,83 @@ class vae(nn.Module):
                 loss.backward()
                 self.optimizer.step()
                 if prune:
-                    self.mask()
+                    self.mask(prune_encoder = prune_encoder,
+                              prune_decoder = prune_decoder)
 
             self.log("Epoch[{}/{}] Loss: {} Recon: {} KL: {}".format(epoch+1, 
                                     num_epochs, loss.data.item(), bce.data.item(), kld.data.item()))
-            if epoch % 10 == 0 or epoch == num_epochs - 1:
-                self.compute_inception_fid()
+            if epoch == num_epochs - 1:
                 #save_image(torch.cat((output, img), 0) * 0.5 + 0.5, './cifar/image_{}.png'.format(epoch))
+                self.compute_inception_fid()
                 sample, mu, logvar = self.forward(test_input.cuda())
-                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))
-    
+                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
+                
         torch.save(self.state_dict(), path + '/vae.pth')
 
-num_epochs = 100
-batch_size = 128
-learning_rate = 1e-3
+parser = argparse.ArgumentParser(description='PyTorch VAE')
 
+parser.add_argument('--num_epochs', default=300, type=int)
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--lr', default=1e-3, type=float)
+parser.add_argument('--image_size', default=32, type=int)
+parser.add_argument('--dataset', default='../datasets/cifar', type=str)
+parser.add_argument('--inception_cache_path', default='./inception_cache/cifar', type=str)
+parser.add_argument('--log_path', default='./cifar_test', type=str)
+parser.add_argument('--init_state', default='./cifar/before_train.pth', type=str)
+parser.add_argument('--trained_original_model_state', default='./cifar/vae.pth', type=str)
+parser.add_argument('--init_with_old', default='True', type=str)
+parser.add_argument('--prune_encoder', default='True', type=str)
+parser.add_argument('--prune_decoder', default='True', type=str)
+   
+args = parser.parse_args()
+
+if args.num_epochs != '':
+     num_epochs = args.num_epochs
+        
+if args.batch_size != '':
+     batch_size = args.batch_size
+        
+if args.lr != '':
+     learning_rate = args.lr
+        
+if args.image_size != '':
+     image_size = args.image_size
+
+if args.dataset != '':
+     dataset = args.dataset
+        
+if args.inception_cache_path != '':
+     inception_cache_path = args.inception_cache_path
+
+if args.log_path != '':
+     path = args.log_path
+        
+if args.init_state != '':
+     init_state = args.init_state
+
+if args.trained_original_model_state != '':
+     trained_original_model_state = args.trained_original_model_state
+
+if args.init_with_old != '':
+     init_with_old = args.init_with_old == 'True'
+        
+if args.prune_encoder != '':
+     prune_encoder = args.prune_encoder == 'True'
+        
+if args.prune_decoder != '':
+     prune_decoder = args.prune_decoder == 'True'
+        
 img_transform = transforms.Compose([
-            transforms.Resize(32),
+            transforms.Resize(image_size),
             transforms.ToTensor(),
             transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
         ])
 
-dataset = CIFAR10('../datasets/cifar', download=True, transform=img_transform)
-#dataset = MNIST('../datasets/mnist', download=True, transform=img_transform)
+if 'cifar' in dataset:
+    dataset = CIFAR10(dataset, download=True, transform=img_transform)
+if 'mnist' in dataset:
+    dataset = MNIST(dataset, download=True, transform=img_transform)
+
 dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -284,11 +357,6 @@ nc = 3
 test_input, classes = next(iter(dataloader1)) 
 print(classes)
 
-inception_cache_path = './inception_cache/cifar'
-path = './cifar'
-init_state = './cifar/before_train.pth'
-trained_original_model_state = './cifar/vae.pth'
-init_with_old = True
 
 fh = open(path + "/train.log", 'w')
 fh.write('Logging')
@@ -298,13 +366,13 @@ inception_tf.initialize_inception()
 
 model = vae().cuda()
 #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
-'''
+#model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+
 model.iterative_prune(init_state = init_state, 
                     trained_original_model_state = trained_original_model_state, 
                     number_of_iterations = 20, 
                     percent = 20, 
-                    init_with_old = init_with_old)
-
-'''
+                    init_with_old = init_with_old,
+                    prune_encoder = prune_encoder,
+                    prune_decoder = prune_decoder)
 
