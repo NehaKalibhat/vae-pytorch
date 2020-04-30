@@ -12,83 +12,59 @@ import pdb
 import matplotlib.pyplot as plt
 import argparse
 import torch.nn.functional as F
+from torch.distributions.normal import Normal
+from torch.distributions import kl_divergence
 import inception_tf
 import fid
 import os.path as osp
 
 class vae(nn.Module):
-    def __init__(self, nz = 128):
+    def __init__(self, input_dim, dim, z_dim = 128):
         super(vae, self).__init__()
-        self.nz = nz
         self.have_cuda = True
+        self.z_dim = z_dim
         self.device = 'cuda'
         self.encoder = nn.Sequential(
-            nn.Conv2d(nc, ngf, kernel_size=2, stride=2), # 16x16
-            nn.ReLU(),
-            nn.Conv2d(ngf, ngf*2, kernel_size=2, stride=2), # 8x8
-            nn.ReLU(),
-            nn.Conv2d(ngf*2, ngf*4, kernel_size=2, stride=2), # 4x4
-            nn.ReLU(),
-            nn.Conv2d(ngf*4, ngf*8, kernel_size=2, stride=2), # 2x2
-            nn.ReLU(),
-            nn.Conv2d(ngf*8, ngf*16, kernel_size=2, stride=2), # 1x1
-            nn.ReLU(),
+            nn.Conv2d(input_dim, dim, 4, 2, 1),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.Conv2d(dim, dim, 4, 2, 1),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.Conv2d(dim, dim, 5, 1, 0),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.Conv2d(dim, z_dim * 2, 3, 1, 0),
+            nn.BatchNorm2d(z_dim * 2)
         )
 
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(ndf*16, ndf*8, kernel_size=2, stride=2), # 2x2
-            nn.ReLU(),
-            nn.ConvTranspose2d(ndf*8, ndf*4, kernel_size=2, stride=2), # 4x4
-            nn.ReLU(),
-            nn.ConvTranspose2d(ndf*4, ndf*2, kernel_size=2, stride=2), # 8x8
-            nn.ReLU(),
-            nn.ConvTranspose2d(ndf*2, ndf, kernel_size=2, stride=2), # 16x16
-            nn.ReLU(),
-            nn.ConvTranspose2d(ndf, nc, kernel_size=2, stride=2), # 32x32
-            nn.Tanh(),
+            nn.ConvTranspose2d(z_dim, dim, 3, 1, 0),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(dim, dim, 5, 1, 0),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(dim, dim, 4, 2, 1),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
+            nn.Tanh()
         )
-
-        self.fc1 = nn.Linear(1024, nz)
-        self.fc2 = nn.Linear(1024, nz)
-        self.fc3 = nn.Linear(nz, 1024)
         
         self.best_is = 0
         self.best_fid = 0
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=1e-5)
-        
-    def loss_fn(self, recon_x, x, mu, logvar):
-        BCE = nn.MSELoss(size_average=False)(recon_x, x)/x.size(0)
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())/x.size(0)
-        return BCE + KLD, BCE, KLD
 
-    def reparameterize(self, mu, logvar):
-        std = logvar.mul(0.5).exp_()
-        # return torch.normal(mu, std)
-        esp = torch.randn(*mu.size())
-        z = mu + std * esp.cuda()
-        return z
-    
-    def bottleneck(self, h):
-        mu, logvar = self.fc1(h), self.fc2(h)
-        z = self.reparameterize(mu, logvar)
-        return z, mu, logvar
+    def forward(self, x): 
+        mu, logvar = self.encoder(x).chunk(2, dim=1)
+        q_z_x = Normal(mu, logvar.mul(.5).exp())
+        p_z = Normal(torch.zeros_like(mu), torch.ones_like(logvar))
+        kl_div = kl_divergence(q_z_x, p_z).sum(1).mean()
 
-    def encode(self, x):
-        h = self.encoder(x)
-        h = h.view(-1, 1024)
-        z, mu, logvar = self.bottleneck(h)
-        return z, mu, logvar
-
-    def decode(self, z):
-        z = self.fc3(z)
-        z = self.decoder(z.view(-1,1024,1,1))
-        return z
-
-    def forward(self, x):
-        z, mu, logvar = self.encode(x)
-        z = self.decode(z)
-        return z, mu, logvar
+        x_tilde = self.decoder(q_z_x.rsample())
+        return x_tilde, kl_div
     
     def log(self, message):
         print(message)
@@ -113,8 +89,10 @@ class vae(nn.Module):
         num_batches = int(50000 / batch_size)
         for batch in range(num_batches):
             with torch.no_grad():
-                z = torch.randn(batch_size, self.nz, device=self.device)
-                gen = self.decode(z)
+                mu = torch.randn(batch_size, self.z_dim, 2, 2, device=self.device)
+                logvar = torch.randn(batch_size, self.z_dim, 2, 2, device=self.device)
+                q_z_x = Normal(mu, logvar.mul(.5).exp())
+                gen = self.decoder(q_z_x.rsample())
                 gen = gen * 0.5 + 0.5
                 gen = gen * 255.0
                 gen = gen.cpu().numpy().astype(np.uint8)
@@ -218,7 +196,7 @@ class vae(nn.Module):
         self.log("***************Iterative Pruning started. Number of iterations: {} *****************".format(number_of_iterations))
         for pruning_iter in range(0, number_of_iterations):
             self.log("Running pruning iteration {}".format(pruning_iter))
-            self.__init__()
+            self.__init__(input_dim = nc, dim = 256, z_dim = 128)
             self = self.cuda()
             trained_model = trained_original_model_state
             if pruning_iter != 0:
@@ -262,10 +240,18 @@ class vae(nn.Module):
         
         for epoch in range(num_epochs):
             for data in dataloader:
-                images, _ = data
-                images = images.cuda()
-                recon_images, mu, logvar = self.forward(images)
-                loss, bce, kld = self.loss_fn(recon_images, images, mu, logvar)
+                x, _ = data
+                x = x.cuda()
+                
+                x_tilde, kl_d = self.forward(x)
+                loss_recons = F.mse_loss(x_tilde, x, size_average=False) / x.size(0)
+                loss = loss_recons + kl_d
+
+                nll = -Normal(x_tilde, torch.ones_like(x_tilde)).log_prob(x)
+                log_px = nll.mean().item() - np.log(128) + kl_d.item()
+                log_px /= np.log(2)
+
+                
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
@@ -274,21 +260,25 @@ class vae(nn.Module):
                               prune_decoder = prune_decoder)
 
             self.log("Epoch[{}/{}] Loss: {} Recon: {} KL: {}".format(epoch+1, 
-                                    num_epochs, loss.data.item(), bce.data.item(), kld.data.item()))
-            if epoch == num_epochs - 1:
+                                    num_epochs, loss.data.item(), loss_recons.data.item(), kl_d.data.item()))
+            if epoch % 10 == 0 or epoch == num_epochs - 1:
                 #save_image(torch.cat((output, img), 0) * 0.5 + 0.5, './cifar/image_{}.png'.format(epoch))
                 self.compute_inception_fid()
-                sample, mu, logvar = self.forward(test_input.cuda())
+                sample, kl = self.forward(test_input.cuda())
                 save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
-                
+#             if epoch == num_epochs - 1:
+#                 self.compute_inception_fid()
+            
         torch.save(self.state_dict(), path + '/vae.pth')
 
 parser = argparse.ArgumentParser(description='PyTorch VAE')
 
-parser.add_argument('--num_epochs', default=300, type=int)
+parser.add_argument('--num_epochs', default=100, type=int)
 parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--lr', default=1e-3, type=float)
 parser.add_argument('--image_size', default=32, type=int)
+parser.add_argument('--hidden_size', default=64, type=int)
+parser.add_argument('--latent_size', default=64, type=int)
 parser.add_argument('--dataset', default='../datasets/cifar', type=str)
 parser.add_argument('--inception_cache_path', default='./inception_cache/cifar', type=str)
 parser.add_argument('--log_path', default='./cifar_test', type=str)
@@ -311,6 +301,12 @@ if args.lr != '':
         
 if args.image_size != '':
      image_size = args.image_size
+        
+if args.hidden_size != '':
+     hidden_size = args.hidden_size
+
+if args.latent_size != '':
+     latent_size = args.latent_size
 
 if args.dataset != '':
      dataset = args.dataset
@@ -350,8 +346,6 @@ if 'mnist' in dataset:
 dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-ngf = 64
-ndf = 64
 nc = 3
        
 test_input, classes = next(iter(dataloader1)) 
@@ -364,15 +358,15 @@ fh.close()
 
 inception_tf.initialize_inception()
 
-model = vae().cuda()
+model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size).cuda()
 #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-#model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
 
-model.iterative_prune(init_state = init_state, 
-                    trained_original_model_state = trained_original_model_state, 
-                    number_of_iterations = 20, 
-                    percent = 20, 
-                    init_with_old = init_with_old,
-                    prune_encoder = prune_encoder,
-                    prune_decoder = prune_decoder)
+# model.iterative_prune(init_state = init_state, 
+#                     trained_original_model_state = trained_original_model_state, 
+#                     number_of_iterations = 20, 
+#                     percent = 20, 
+#                     init_with_old = init_with_old,
+#                     prune_encoder = prune_encoder,
+#                     prune_decoder = prune_decoder)
 
