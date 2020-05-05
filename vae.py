@@ -125,6 +125,7 @@ class vae(nn.Module):
         new_state = {}
         for name in model_state['vae']:
             if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                self.log(f"loading {name}")
                 new_state[name] = model_state['vae'][name]
             else:
                 new_state[name] = self.state_dict()[name]
@@ -142,9 +143,9 @@ class vae(nn.Module):
             masks = {}
             flat_model_weights = np.array([])
             for name in model:
-                #if "weight" in name:
-                layer_weights = model[name].data.cpu().numpy()
-                flat_model_weights = np.concatenate((flat_model_weights, layer_weights.flatten()))
+                if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                    layer_weights = model[name].data.cpu().numpy()
+                    flat_model_weights = np.concatenate((flat_model_weights, layer_weights.flatten()))
             global_threshold = np.percentile(abs(flat_model_weights), pruning_perc)
 
             zeros = 0
@@ -156,7 +157,7 @@ class vae(nn.Module):
                     if layer_wise:
                         layer_weights = model[name].data.cpu().numpy()
                         threshold = np.percentile(abs(layer_weights), pruning_perc)
-                    masks[name] = model[name].gt(threshold).int()
+                    masks[name] = model[name].abs().gt(threshold).int()
                     pruned = masks[name].numel() - masks[name].nonzero().size(0)
                     tot = masks[name].numel()
                     frac = pruned / tot
@@ -196,7 +197,7 @@ class vae(nn.Module):
         self.log("***************Iterative Pruning started. Number of iterations: {} *****************".format(number_of_iterations))
         for pruning_iter in range(0, number_of_iterations):
             self.log("Running pruning iteration {}".format(pruning_iter))
-            self.__init__(input_dim = nc, dim = 256, z_dim = 128)
+            self.__init__(input_dim = nc, dim = hidden_size, z_dim = latent_size)
             self = self.cuda()
             trained_model = trained_original_model_state
             if pruning_iter != 0:
@@ -214,7 +215,7 @@ class vae(nn.Module):
             
             torch.save(self.state_dict(), path + "/"+ "end_of_" + str(pruning_iter) + '.pth')
             
-            sample, mu, logvar = self.forward(test_input.cuda())
+            sample, kl = self.forward(test_input.cuda())
             save_image(sample * 0.5 + 0.5, path + '/image_' + str(pruning_iter) + '.png')
             torch.cuda.empty_cache()
             
@@ -261,13 +262,10 @@ class vae(nn.Module):
 
             self.log("Epoch[{}/{}] Loss: {} Recon: {} KL: {}".format(epoch+1, 
                                     num_epochs, loss.data.item(), loss_recons.data.item(), kl_d.data.item()))
-            if epoch % 10 == 0 or epoch == num_epochs - 1:
-                #save_image(torch.cat((output, img), 0) * 0.5 + 0.5, './cifar/image_{}.png'.format(epoch))
+            if epoch == num_epochs - 1:
                 self.compute_inception_fid()
                 sample, kl = self.forward(test_input.cuda())
                 save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
-#             if epoch == num_epochs - 1:
-#                 self.compute_inception_fid()
             
         torch.save(self.state_dict(), path + '/vae.pth')
 
@@ -277,8 +275,8 @@ parser.add_argument('--num_epochs', default=100, type=int)
 parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--lr', default=1e-3, type=float)
 parser.add_argument('--image_size', default=32, type=int)
-parser.add_argument('--hidden_size', default=64, type=int)
-parser.add_argument('--latent_size', default=64, type=int)
+parser.add_argument('--hidden_size', default=256, type=int)
+parser.add_argument('--latent_size', default=32, type=int)
 parser.add_argument('--dataset', default='../datasets/cifar', type=str)
 parser.add_argument('--inception_cache_path', default='./inception_cache/cifar', type=str)
 parser.add_argument('--log_path', default='./cifar_test', type=str)
@@ -358,15 +356,16 @@ fh.close()
 
 inception_tf.initialize_inception()
 
+print(hidden_size, latent_size)
 model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size).cuda()
 #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+#model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
 
-# model.iterative_prune(init_state = init_state, 
-#                     trained_original_model_state = trained_original_model_state, 
-#                     number_of_iterations = 20, 
-#                     percent = 20, 
-#                     init_with_old = init_with_old,
-#                     prune_encoder = prune_encoder,
-#                     prune_decoder = prune_decoder)
+model.iterative_prune(init_state = init_state, 
+                    trained_original_model_state = trained_original_model_state, 
+                    number_of_iterations = 20, 
+                    percent = 20, 
+                    init_with_old = init_with_old,
+                    prune_encoder = prune_encoder,
+                    prune_decoder = prune_decoder)
 
