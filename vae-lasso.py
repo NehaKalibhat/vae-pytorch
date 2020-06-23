@@ -286,8 +286,12 @@ class vae(nn.Module):
                 
                 x_tilde, kl_d = self.forward(x)
                 loss_recons = F.mse_loss(x_tilde, x, size_average=False) / x.size(0)
-                loss = loss_recons + 4 * kl_d
-
+                
+                all_params = torch.cat([x.view(-1) for x in self.parameters()])
+                l1_regularization = 0.5 * torch.norm(all_params, 1)
+            
+                loss = loss_recons + kl_d + l1_regularization
+                
                 nll = -Normal(x_tilde, torch.ones_like(x_tilde)).log_prob(x)
                 log_px = nll.mean().item() - np.log(128) + kl_d.item()
                 log_px /= np.log(2)
@@ -457,8 +461,9 @@ if __name__ == "__main__":
     model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
     model = model.to(model.device)
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-    model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
-
+#     model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+    model.load_state_dict(torch.load(path + "/vae.pth"))
+    pdb.set_trace()
 #     model.iterative_prune(init_state = init_state, 
 #                         trained_original_model_state = trained_original_model_state, 
 #                         number_of_iterations = 20, 

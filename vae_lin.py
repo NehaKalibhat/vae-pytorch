@@ -19,80 +19,32 @@ import inception_tf
 import fid
 import os.path as osp
 
-
 class vae(nn.Module):
-    def __init__(self, input_dim, dim, z_dim = 128):
+    def __init__(self, input_dim=784, dim=256, z_dim=8):
         super(vae, self).__init__()
         self.z_dim = z_dim
-        self.device = 'cuda:0'
-#         self.encoder = nn.Sequential(
-#             nn.Conv2d(input_dim, dim, 4, 2, 1),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.Conv2d(dim, dim, 4, 2, 1),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.Conv2d(dim, dim, 5, 1, 0),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.Conv2d(dim, z_dim * 2, 3, 1, 0),
-#             nn.BatchNorm2d(z_dim * 2)
-#         )
-
-#         self.decoder = nn.Sequential(
-#             nn.ConvTranspose2d(z_dim, dim, 3, 1, 0),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.ConvTranspose2d(dim, dim, 5, 1, 0),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.ConvTranspose2d(dim, dim, 4, 2, 1),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
-#             nn.Tanh()
-#         )
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_dim, dim, 4, 2, 1),
-            nn.BatchNorm2d(dim),
+            nn.Linear(28 * 28, 128),
             nn.ReLU(True),
-            nn.Conv2d(dim, dim*2, 4, 2, 1),
-            nn.BatchNorm2d(dim*2),
-            nn.ReLU(True),
-            nn.Conv2d(dim*2, dim*4 , 4, 2, 1),
-            nn.BatchNorm2d(dim*4),
-            nn.ReLU(True),
-            nn.Conv2d(dim*4, dim*8, 4, 2, 1),
-            nn.BatchNorm2d(dim*8),
-            nn.ReLU(True),
-            nn.Conv2d(dim*8, z_dim * 2, 2, 1, 0),
-            nn.BatchNorm2d(z_dim * 2)
-        )
-
+            nn.Linear(128, 64),
+            nn.ReLU(True), 
+            nn.Linear(64, 32), 
+            nn.ReLU(True), 
+            nn.Linear(32, self.z_dim*2))
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(z_dim, dim*8, 2, 1, 0),
-            nn.BatchNorm2d(dim*8),
+            nn.Linear(self.z_dim, 32),
             nn.ReLU(True),
-            nn.ConvTranspose2d(dim*8, dim*4, 4, 2, 1),
-            nn.BatchNorm2d(dim*4),
+            nn.Linear(32, 64),
             nn.ReLU(True),
-            nn.ConvTranspose2d(dim*4, dim*2, 4, 2, 1),
-            nn.BatchNorm2d(dim*2),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim*2, dim, 4, 2, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
-            nn.Tanh()
-        )
+            nn.Linear(64, 128),
+            nn.ReLU(True), 
+            nn.Linear(128, 28 * 28), 
+            nn.Tanh())
         
-#         self.encoder = nn.DataParallel(self.encoder)
-#         self.decoder = nn.DataParallel(self.decoder)
-            
         self.best_is = 0
         self.best_fid = 0
         
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=1e-5)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
 
     def forward(self, x): 
         mu, logvar = self.encoder(x).chunk(2, dim=1)
@@ -126,17 +78,16 @@ class vae(nn.Module):
         num_batches = int(50000 / batch_size)
         for batch in range(num_batches):
             with torch.no_grad():
-                mu = torch.randn(batch_size, self.z_dim, 1, 1, device=self.device)
-                logvar = torch.randn(batch_size, self.z_dim, 1, 1, device=self.device)
+                mu = torch.randn(batch_size, self.z_dim).cuda()
+                logvar = torch.randn(batch_size, self.z_dim).cuda()
                 q_z_x = Normal(mu, logvar.mul(.5).exp())
                 gen = self.decoder(q_z_x.rsample())
+                gen = gen.view(-1, nc, image_size, image_size)
                 gen = gen * 0.5 + 0.5
                 gen = gen * 255.0
                 gen = gen.cpu().numpy().astype(np.uint8)
                 gen = np.transpose(gen, (0, 2, 3, 1))
                 samples.extend(gen)
-                
-                torch.cuda.empty_cache()
 
         IS_mean, IS_std = self.compute_inception_score(samples)
         fid = self.compute_fid(samples)
@@ -177,7 +128,7 @@ class vae(nn.Module):
         model = None
         if trained_original_model_state:
             model = torch.load(trained_original_model_state)
-            
+        
         if pruning_perc > 0:
             masks = {}
             flat_model_weights = np.array([])
@@ -203,7 +154,6 @@ class vae(nn.Module):
                     self.log(f"{name} : {pruned} / {tot}  {frac}")
                     zeros += pruned
                     total += tot
-                    torch.cuda.empty_cache()
             self.log(f"Fraction of weights pruned = {zeros}/{total} = {zeros/total}")
             self.masks = masks
     
@@ -237,8 +187,8 @@ class vae(nn.Module):
         self.log("***************Iterative Pruning started. Number of iterations: {} *****************".format(number_of_iterations))
         for pruning_iter in range(0, number_of_iterations):
             self.log("Running pruning iteration {}".format(pruning_iter))
-            self.__init__(input_dim = nc, dim = hidden_size, z_dim = latent_size)
-            self = self.to(self.device)
+            self.__init__(input_dim = nc * image_size * image_size)
+            self = self.cuda()
             trained_model = trained_original_model_state
             if pruning_iter != 0:
                 trained_model = path + "/"+ "end_of_" + str(pruning_iter - 1) + '.pth'
@@ -255,7 +205,8 @@ class vae(nn.Module):
             
             torch.save(self.state_dict(), path + "/"+ "end_of_" + str(pruning_iter) + '.pth')
             
-            sample, kl = self.forward(test_input.to(self.device))
+            sample, kl = self.forward(test_input.cuda())
+            sample = sample.view(-1, nc, image_size, image_size)
             save_image(sample * 0.5 + 0.5, path + '/image_' + str(pruning_iter) + '.png')
             torch.cuda.empty_cache()
             
@@ -269,7 +220,7 @@ class vae(nn.Module):
                 model[name].data.mul_(self.masks[name])
         self.load_state_dict(model)
     
-    def train(self, prune, init_state = None, init_with_old = True, prune_encoder = True, prune_decoder = True):
+    def train(self, prune, init_state, init_with_old, prune_encoder = True, prune_decoder = True):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
         if not prune:
             self.save(path + '/before_train.pth')
@@ -282,11 +233,11 @@ class vae(nn.Module):
         for epoch in range(num_epochs):
             for data in dataloader:
                 x, _ = data
-                x = x.to(self.device)
+                x = x.view(x.size(0), -1).cuda()
                 
                 x_tilde, kl_d = self.forward(x)
                 loss_recons = F.mse_loss(x_tilde, x, size_average=False) / x.size(0)
-                loss = loss_recons + 4 * kl_d
+                loss = loss_recons + kl_d
 
                 nll = -Normal(x_tilde, torch.ones_like(x_tilde)).log_prob(x)
                 log_px = nll.mean().item() - np.log(128) + kl_d.item()
@@ -306,61 +257,13 @@ class vae(nn.Module):
                                                                                       log_px,
                                                                                       loss_recons.data.item(), 
                                                                                       kl_d.data.item()))
-            if epoch > 0 and (epoch % 20 == 0 or epoch == num_epochs - 1):
-                self.compute_inception_fid()
-                sample, kl = self.forward(test_input.to(self.device))
-                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
+#             if epoch > 0 and (epoch % 20 == 0 or epoch == num_epochs - 1):
+#                 #self.compute_inception_fid()
+#                 sample, kl = self.forward(test_input.cuda())
+#                 sample = sample.view(-1, nc, image_size, image_size)
+#                 save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(epoch))    
             
         torch.save(self.state_dict(), path + '/vae.pth')
-
-# batch_size = 128
-# img_transform = transforms.Compose([
-#                 transforms.Resize(32),
-#                 transforms.RandomCrop(32),
-#                 #transforms.Grayscale(3),
-#                 transforms.ToTensor(),
-#                 transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
-#             ])
-
-# dataset = datasets.ImageFolder("../datasets/celeba_short", transform=img_transform)
-# dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-# dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-# test_input, classes = next(iter(dataloader1))
-
-# inception_tf.initialize_inception()
-
-# inception_cache_path = './inception_cache/celeba'
-# path = 'celeba_test'
-# num_epochs = 100
-
-# for i in range(19):
-#     gan = torch.load("../gan-pytorch/celeba_iter_1/end_of_"+str(i)+".pth")
-#     vae = vae(input_dim = 3, dim = 64, z_dim = 32)
-#     vae = vae.to(vae.device)
-#     model = vae.state_dict()
-#     for name in gan:
-#         if 'D.' in name and '9' not in name:
-#             vae_layer = name.replace('D', 'encoder')
-#         if 'G.' in name and '3' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('3', '6')
-#         if 'G.' in name and '4' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('4', '7')
-#         if 'G.' in name and '6' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('6', '9')
-#         if 'G.' in name and '7' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('7', '10')
-#         if 'G.' in name and '9' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('9', '12')  
-
-#         model[vae_layer] = gan[name]
-
-#     vae.load_state_dict(model)
-#     vae.train(prune = False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch VAE')
@@ -429,7 +332,7 @@ if __name__ == "__main__":
                 transforms.RandomCrop(image_size),
                 #transforms.Grayscale(3),
                 transforms.ToTensor(),
-                transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+                transforms.Normalize((0.5,), (0.5,))
             ])
 
     if 'cifar' in dataset:
@@ -442,9 +345,10 @@ if __name__ == "__main__":
     dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    nc = 3
+    nc = 1
 
-    test_input, classes = next(iter(dataloader1))
+    test_input, classes = next(iter(dataloader1)) 
+    test_input = test_input.view(test_input.size(0), -1)
     print(classes)
 
 
@@ -454,16 +358,15 @@ if __name__ == "__main__":
 
     inception_tf.initialize_inception()
 
-    model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
-    model = model.to(model.device)
+    model = vae(input_dim = nc * image_size * image_size).cuda()
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-    model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+    #model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
 
-#     model.iterative_prune(init_state = init_state, 
-#                         trained_original_model_state = trained_original_model_state, 
-#                         number_of_iterations = 20, 
-#                         percent = 20, 
-#                         init_with_old = init_with_old,
-#                         prune_encoder = prune_encoder,
-#                         prune_decoder = prune_decoder)
+    model.iterative_prune(init_state = init_state, 
+                        trained_original_model_state = trained_original_model_state, 
+                        number_of_iterations = 20, 
+                        percent = 20, 
+                        init_with_old = init_with_old,
+                        prune_encoder = prune_encoder,
+                        prune_decoder = prune_decoder)
 

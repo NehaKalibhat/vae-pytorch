@@ -18,8 +18,79 @@ from torch.distributions import kl_divergence
 import inception_tf
 import fid
 import os.path as osp
+from compute_flops import print_model_param_nums, print_model_param_flops
 
+class EarlyBird():
+    def __init__(self, percent, epoch_keep=5):
+        self.percent = percent
+        self.epoch_keep = epoch_keep
+        self.masks = []
+        self.dists = [1 for i in range(1, self.epoch_keep)]
 
+    def pruning(self, model, percent):
+        total = 0
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                total += m.weight.data.shape[0]
+
+        bn = torch.zeros(total)
+        index = 0
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                size = m.weight.data.shape[0]
+                bn[index:(index+size)] = m.weight.data.abs().clone()
+                index += size
+
+        y, i = torch.sort(bn)
+        thre_index = int(total * percent)
+        thre = y[thre_index]
+        # print('Pruning threshold: {}'.format(thre))
+
+        mask = torch.zeros(total)
+        index = 0
+        for k, m in enumerate(model.modules()):
+            if isinstance(m, nn.BatchNorm2d):
+                size = m.weight.data.numel()
+                weight_copy = m.weight.data.abs().clone()
+                _mask = weight_copy.gt(thre.cuda()).float().cuda()
+                mask[index:(index+size)] = _mask.view(-1)
+                # print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.format(k, _mask.shape[0], int(torch.sum(_mask))))
+                index += size
+
+        # print('Pre-processing Successful!')
+        return mask
+
+    def put(self, mask):
+        if len(self.masks) < self.epoch_keep:
+            self.masks.append(mask)
+        else:
+            self.masks.pop(0)
+            self.masks.append(mask)
+
+    def cal_dist(self):
+        if len(self.masks) == self.epoch_keep:
+            for i in range(len(self.masks)-1):
+                mask_i = self.masks[-1]
+                mask_j = self.masks[i]
+                self.dists[i] = 1 - float(torch.sum(mask_i==mask_j)) / mask_j.size(0)
+            return True
+        else:
+            return False
+
+    def early_bird_emerge(self, model):
+        mask = self.pruning(model, self.percent)
+        self.put(mask)
+        flag = self.cal_dist()
+        if flag == True:
+            print(self.dists)
+            for i in range(len(self.dists)):
+                if self.dists[i] > 0.1:
+                    return False
+            return True
+        else:
+            return False
+        
+        
 class vae(nn.Module):
     def __init__(self, input_dim, dim, z_dim = 128):
         super(vae, self).__init__()
@@ -269,17 +340,25 @@ class vae(nn.Module):
                 model[name].data.mul_(self.masks[name])
         self.load_state_dict(model)
     
-    def train(self, prune, init_state = None, init_with_old = True, prune_encoder = True, prune_decoder = True):
+    def train(self, pruning_perc):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
-        if not prune:
-            self.save(path + '/before_train.pth')
         
-        if prune and init_with_old:
-            self.load(init_state, 
-                      prune_encoder = prune_encoder,
-                      prune_decoder = prune_decoder)
+        self.log(f'original model param: {print_model_param_nums(self)}')
+        self.log(f'original model flops: {print_model_param_flops(self, image_size, True)}')
+        
+        
+        eb = EarlyBird(pruning_perc, epoch_keep = 5)
+        found_eb = False
         
         for epoch in range(num_epochs):
+            if not found_eb and eb.early_bird_emerge(self):
+                found_eb = True
+                print("FOUND EARLY BIRD TICKET, Pruning model to ", pruning_perc)
+                self = one_shot_prune(self, pruning_perc)
+
+                self.log(f'pruned model param: {print_model_param_nums(self)}')
+                self.log(f'pruned model flops: {print_model_param_flops(self, image_size, True)}')
+
             for data in dataloader:
                 x, _ = data
                 x = x.to(self.device)
@@ -296,9 +375,7 @@ class vae(nn.Module):
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                if prune:
-                    self.mask(prune_encoder = prune_encoder,
-                              prune_decoder = prune_decoder)
+                
 
             self.log("Epoch[{}/{}] Loss: {} log_px:{} Recon: {} KL: {}".format(epoch+1, 
                                                                                       num_epochs, 
@@ -306,12 +383,161 @@ class vae(nn.Module):
                                                                                       log_px,
                                                                                       loss_recons.data.item(), 
                                                                                       kl_d.data.item()))
-            if epoch > 0 and (epoch % 20 == 0 or epoch == num_epochs - 1):
+            if epoch == num_epochs - 1:
                 self.compute_inception_fid()
                 sample, kl = self.forward(test_input.to(self.device))
-                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
+                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(pruning_perc))    
             
         torch.save(self.state_dict(), path + '/vae.pth')
+
+def one_shot_prune(model, pruning_perc):
+    
+    for name, param in model.named_parameters():
+        print(name, param.data.numel())
+    
+    
+    model.log(f"************pruning {pruning_perc} of the network****************")
+
+    total = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            total += m.weight.data.shape[0]
+
+    bn = torch.zeros(total)
+    index = 0
+    for k, m in enumerate(model.modules()):
+        if isinstance(m, nn.BatchNorm2d) and k != 15:
+            size = m.weight.data.shape[0]
+            bn[index:(index+size)] = m.weight.data.abs().clone()
+            index += size
+
+    p_flops = 0
+    y, i = torch.sort(bn)
+    # comparsion and permutation (sort process)
+    p_flops += total * np.log2(total) * 3
+    thre_index = int(total * pruning_perc)
+    thre = y[thre_index]
+
+    pruned = 0
+    cfg = []
+    cfg_mask = []
+    for k, m in enumerate(model.modules()):
+        if isinstance(m, nn.BatchNorm2d):
+            weight_copy = m.weight.data.abs().clone()
+            if k == 15:
+                mask = torch.ones_like(weight_copy).cuda()
+            else:
+                mask = weight_copy.gt(thre.cuda()).float().cuda()
+            pruned = pruned + mask.shape[0] - torch.sum(mask)
+            m.weight.data.mul_(mask)
+            m.bias.data.mul_(mask)
+            if int(torch.sum(mask)) > 0:
+                cfg.append(int(torch.sum(mask)))
+            cfg_mask.append(mask.clone())
+            print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
+                format(k, mask.shape[0], int(torch.sum(mask))))
+        elif isinstance(m, nn.MaxPool2d):
+            cfg.append('M')
+    print(cfg)
+    # apply mask flops
+    # p_flops += total
+
+    # compare two mask distance
+    p_flops += 2 * total #(minus and sum)
+
+    pruned_ratio = pruned/total
+    print("Pruned ratio: ", pruned_ratio)
+    print('  + Memory Request: %.2fKB' % float(total * 32 / 1024 / 8))
+    print('  + Flops for pruning: %.2fM' % (p_flops / 1e6))
+
+    newmodel = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
+
+    layer_id_in_cfg = 0
+    start_mask = torch.ones(3)
+    end_mask = cfg_mask[layer_id_in_cfg]
+    for [m0, m1] in zip(model.modules(), newmodel.modules()):
+        print("Layer id ", layer_id_in_cfg)
+        if isinstance(m0, nn.BatchNorm2d):
+            print(end_mask)
+            if torch.sum(end_mask) == 0:
+                continue
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1,(1,))
+            m1.weight.data = m0.weight.data[idx1.tolist()].clone()
+            m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+            m1.running_mean = m0.running_mean[idx1.tolist()].clone()
+            m1.running_var = m0.running_var[idx1.tolist()].clone()
+            layer_id_in_cfg += 1
+            start_mask = end_mask.clone()
+            if layer_id_in_cfg < len(cfg_mask):
+                end_mask = cfg_mask[layer_id_in_cfg]
+        elif isinstance(m0, nn.Conv2d):
+            if torch.sum(end_mask) == 0:
+                continue
+            idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            # random set for test
+            # new_end_mask = np.asarray(end_mask.cpu().numpy())
+            # new_end_mask = np.append(new_end_mask[int(len(new_end_mask)/2):], new_end_mask[:int(len(new_end_mask)/2)])
+            # idx1 = np.squeeze(np.argwhere(new_end_mask))
+
+            print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
+            if idx0.size == 1:
+                idx0 = np.resize(idx0, (1,))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1, (1,))
+            w1 = None
+            if m1.weight.shape[0] == 1:
+                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()
+                m1.bias.data = m0.bias.data.clone()
+                layer_id_in_cfg -= 1
+            else:
+                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()
+                w1 = w1[idx1.tolist(), :, :, :].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                
+            m1.weight.data = w1.clone()
+            
+        elif isinstance(m0, nn.ConvTranspose2d):
+            if torch.sum(end_mask) == 0:
+                continue
+            idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            # random set for test
+            # new_end_mask = np.asarray(end_mask.cpu().numpy())
+            # new_end_mask = np.append(new_end_mask[int(len(new_end_mask)/2):], new_end_mask[:int(len(new_end_mask)/2)])
+            # idx1 = np.squeeze(np.argwhere(new_end_mask))
+
+            print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
+            if idx0.size == 1:
+                idx0 = np.resize(idx0, (1,))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1, (1,))
+            w1 = None
+            if m1.weight.shape[0] == latent_size:
+                w1 = m0.weight.data[:, idx1.tolist(), :, :].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                layer_id_in_cfg += 1
+            elif m1.weight.shape[1] == 3:
+                w1 = m0.weight.data[idx0.tolist(), :, :, :].clone()
+                m1.bias.data = m0.bias.data.clone()
+            else:   
+                w1 = m0.weight.data[:, idx1.tolist(), :, :].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                w1 = w1[idx0.tolist(), :, :, :].clone()   
+            
+            m1.weight.data = w1.clone()
+
+    #torch.save({'cfg': cfg, 'state_dict': newmodel.state_dict()}, os.path.join(args.save, 'pruned.pth.tar'))
+
+    model = newmodel
+    
+    for name, param in model.named_parameters():
+        print(name, param.data.numel())
+        
+    return model
+
 
 # batch_size = 128
 # img_transform = transforms.Compose([
@@ -457,7 +683,7 @@ if __name__ == "__main__":
     model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
     model = model.to(model.device)
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-    model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+    model.train(0.3)
 
 #     model.iterative_prune(init_state = init_state, 
 #                         trained_original_model_state = trained_original_model_state, 

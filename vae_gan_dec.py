@@ -86,8 +86,8 @@ class vae(nn.Module):
             nn.Tanh()
         )
         
-#         self.encoder = nn.DataParallel(self.encoder)
-#         self.decoder = nn.DataParallel(self.decoder)
+        self.encoder = nn.DataParallel(self.encoder)
+        self.decoder = nn.DataParallel(self.decoder)
             
         self.best_is = 0
         self.best_fid = 0
@@ -265,8 +265,9 @@ class vae(nn.Module):
     def mask(self, prune_encoder = True, prune_decoder = True):
         model = self.state_dict()
         for name in model:
-            if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+            if (("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder)) and name in self.masks:
                 model[name].data.mul_(self.masks[name])
+                
         self.load_state_dict(model)
     
     def train(self, prune, init_state = None, init_with_old = True, prune_encoder = True, prune_decoder = True):
@@ -306,61 +307,53 @@ class vae(nn.Module):
                                                                                       log_px,
                                                                                       loss_recons.data.item(), 
                                                                                       kl_d.data.item()))
-            if epoch > 0 and (epoch % 20 == 0 or epoch == num_epochs - 1):
+            if epoch > 0 and epoch == num_epochs - 1:
                 self.compute_inception_fid()
-                sample, kl = self.forward(test_input.to(self.device))
-                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
+#                 sample, kl = self.forward(test_input.to(self.device))
+#                 save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
             
         torch.save(self.state_dict(), path + '/vae.pth')
 
-# batch_size = 128
-# img_transform = transforms.Compose([
-#                 transforms.Resize(32),
-#                 transforms.RandomCrop(32),
-#                 #transforms.Grayscale(3),
-#                 transforms.ToTensor(),
-#                 transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
-#             ])
+    def load_gan(self, gan_init_path, gan_trained_path):
+        gan_init = torch.load(gan_init_path)['gan']
+        gan_trained = torch.load(gan_trained_path)
+        model = self.state_dict()
+        zeros = 0
+        total = 0
+        masks = {}
+        for name in gan_init:
+            vae_layer = None
+            if 'G.' in name and '1' in name:
+                vae_layer = name.replace('G', 'decoder')
+                vae_layer = vae_layer.replace('1', '4')
+            if 'G.' in name and '3' in name:
+                vae_layer = name.replace('G', 'decoder')
+                vae_layer = vae_layer.replace('3', '6')
+            if 'G.' in name and '4' in name:
+                vae_layer = name.replace('G', 'decoder')
+                vae_layer = vae_layer.replace('4', '7')
+            if 'G.' in name and '6' in name:
+                vae_layer = name.replace('G', 'decoder')
+                vae_layer = vae_layer.replace('6', '9')
+            if 'G.' in name and '7' in name:
+                vae_layer = name.replace('G', 'decoder')
+                vae_layer = vae_layer.replace('7', '10')
+            if 'G.' in name and '9' in name:
+                vae_layer = name.replace('G', 'decoder')
+                vae_layer = vae_layer.replace('9', '12')  
+            if vae_layer:
+                model[vae_layer] = gan_init[name]
+                masks[vae_layer] = gan_trained[name].abs().gt(0).int()
+                pruned = masks[vae_layer].numel() - masks[vae_layer].nonzero().size(0)
+                tot = masks[vae_layer].numel()
+                frac = pruned / tot
+                self.log(f"{vae_layer} : {pruned} / {tot}  {frac}")
+                zeros += pruned
+                total += tot
+        self.load_state_dict(model)
+        self.log(f"Fraction of weights pruned = {zeros}/{total} = {zeros/total}")
+        self.masks = masks       
 
-# dataset = datasets.ImageFolder("../datasets/celeba_short", transform=img_transform)
-# dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-# dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-# test_input, classes = next(iter(dataloader1))
-
-# inception_tf.initialize_inception()
-
-# inception_cache_path = './inception_cache/celeba'
-# path = 'celeba_test'
-# num_epochs = 100
-
-# for i in range(19):
-#     gan = torch.load("../gan-pytorch/celeba_iter_1/end_of_"+str(i)+".pth")
-#     vae = vae(input_dim = 3, dim = 64, z_dim = 32)
-#     vae = vae.to(vae.device)
-#     model = vae.state_dict()
-#     for name in gan:
-#         if 'D.' in name and '9' not in name:
-#             vae_layer = name.replace('D', 'encoder')
-#         if 'G.' in name and '3' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('3', '6')
-#         if 'G.' in name and '4' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('4', '7')
-#         if 'G.' in name and '6' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('6', '9')
-#         if 'G.' in name and '7' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('7', '10')
-#         if 'G.' in name and '9' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('9', '12')  
-
-#         model[vae_layer] = gan[name]
-
-#     vae.load_state_dict(model)
-#     vae.train(prune = False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch VAE')
@@ -454,11 +447,19 @@ if __name__ == "__main__":
 
     inception_tf.initialize_inception()
 
-    model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
-    model = model.to(model.device)
+#     model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
+#     model = model.to(model.device)
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-    model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+    #model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+    
+    for i in range(20):
+        model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size).cuda()
+        model.load_gan(gan_init_path = '../gan-pytorch/celeba/before_train.pth', gan_trained_path = '../gan-pytorch/celeba_iter_1/end_of_'+str(i)+'.pth')
+        model.train(prune = True, init_with_old = False)
+        sample, kl = model.forward(test_input.cuda())
+        save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(i))
 
+        
 #     model.iterative_prune(init_state = init_state, 
 #                         trained_original_model_state = trained_original_model_state, 
 #                         number_of_iterations = 20, 

@@ -1,8 +1,7 @@
-import os
 import torch
-import torchvision
 from torch import nn
-from torch.autograd import Variable
+from torch.nn import functional as F 
+import argparse
 from torch.utils.data import DataLoader
 from torchvision import transforms
 import torchvision.datasets as datasets
@@ -10,99 +9,201 @@ from torchvision.datasets import MNIST, CIFAR10
 from torchvision.utils import save_image
 import numpy as np
 import pdb
-import matplotlib.pyplot as plt
-import argparse
-import torch.nn.functional as F
-from torch.distributions.normal import Normal
-from torch.distributions import kl_divergence
 import inception_tf
 import fid
 import os.path as osp
 
+class VectorQuantizer(nn.Module):
+    """
+    Reference:
+    [1] https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
+    """
+    def __init__(self,
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 beta: float = 0.25):
+        super(VectorQuantizer, self).__init__()
+        self.K = num_embeddings
+        self.D = embedding_dim
+        self.beta = beta
 
-class vae(nn.Module):
-    def __init__(self, input_dim, dim, z_dim = 128):
-        super(vae, self).__init__()
-        self.z_dim = z_dim
-        self.device = 'cuda:0'
-#         self.encoder = nn.Sequential(
-#             nn.Conv2d(input_dim, dim, 4, 2, 1),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.Conv2d(dim, dim, 4, 2, 1),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.Conv2d(dim, dim, 5, 1, 0),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.Conv2d(dim, z_dim * 2, 3, 1, 0),
-#             nn.BatchNorm2d(z_dim * 2)
-#         )
+        self.embedding = nn.Embedding(self.K, self.D)
+        self.embedding.weight.data.uniform_(-1 / self.K, 1 / self.K)
 
-#         self.decoder = nn.Sequential(
-#             nn.ConvTranspose2d(z_dim, dim, 3, 1, 0),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.ConvTranspose2d(dim, dim, 5, 1, 0),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.ConvTranspose2d(dim, dim, 4, 2, 1),
-#             nn.BatchNorm2d(dim),
-#             nn.ReLU(True),
-#             nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
-#             nn.Tanh()
-#         )
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_dim, dim, 4, 2, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(True),
-            nn.Conv2d(dim, dim*2, 4, 2, 1),
-            nn.BatchNorm2d(dim*2),
-            nn.ReLU(True),
-            nn.Conv2d(dim*2, dim*4 , 4, 2, 1),
-            nn.BatchNorm2d(dim*4),
-            nn.ReLU(True),
-            nn.Conv2d(dim*4, dim*8, 4, 2, 1),
-            nn.BatchNorm2d(dim*8),
-            nn.ReLU(True),
-            nn.Conv2d(dim*8, z_dim * 2, 2, 1, 0),
-            nn.BatchNorm2d(z_dim * 2)
+    def forward(self, latents):
+        latents = latents.permute(0, 2, 3, 1).contiguous()  # [B x D x H x W] -> [B x H x W x D]
+        latents_shape = latents.shape
+        flat_latents = latents.view(-1, self.D)  # [BHW x D]
+
+        # Compute L2 distance between latents and embedding weights
+        dist = torch.sum(flat_latents ** 2, dim=1, keepdim=True) + \
+               torch.sum(self.embedding.weight ** 2, dim=1) - \
+               2 * torch.matmul(flat_latents, self.embedding.weight.t())  # [BHW x K]
+
+        # Get the encoding that has the min distance
+        encoding_inds = torch.argmin(dist, dim=1).unsqueeze(1)  # [BHW, 1]
+
+        # Convert to one-hot encodings
+        device = latents.device
+        encoding_one_hot = torch.zeros(encoding_inds.size(0), self.K, device=device)
+        encoding_one_hot.scatter_(1, encoding_inds, 1)  # [BHW x K]
+
+        # Quantize the latents
+        quantized_latents = torch.matmul(encoding_one_hot, self.embedding.weight)  # [BHW, D]
+        quantized_latents = quantized_latents.view(latents_shape)  # [B x H x W x D]
+
+        # Compute the VQ Losses
+        commitment_loss = F.mse_loss(quantized_latents.detach(), latents)
+        embedding_loss = F.mse_loss(quantized_latents, latents.detach())
+
+        vq_loss = commitment_loss * self.beta + embedding_loss
+
+        # Add the residue back to the latents
+        quantized_latents = latents + (quantized_latents - latents).detach()
+
+        return quantized_latents.permute(0, 3, 1, 2).contiguous(), vq_loss  # [B x D x H x W]
+
+class ResidualLayer(nn.Module):
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int):
+        super(ResidualLayer, self).__init__()
+        self.resblock = nn.Sequential(nn.Conv2d(in_channels, out_channels,
+                                                kernel_size=3, padding=1, bias=False),
+                                      nn.ReLU(True),
+                                      nn.Conv2d(out_channels, out_channels,
+                                                kernel_size=1, bias=False))
+
+    def forward(self, input):
+        return input + self.resblock(input)
+
+
+class VQVAE(nn.Module):
+
+    def __init__(self,
+                 in_channels: int = 3,
+                 embedding_dim: int = 32,
+                 num_embeddings: int = 128,
+                 hidden_dims = None,
+                 beta: float = 0.25,
+                 img_size: int = 32,
+                 **kwargs) -> None:
+        super(VQVAE, self).__init__()
+
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.img_size = img_size
+        self.beta = beta
+
+        modules = []
+        if hidden_dims is None:
+            hidden_dims = [32, 64, 128, 256]
+
+        # Build Encoder
+        for h_dim in hidden_dims:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels=h_dim,
+                              kernel_size=4, stride=2, padding=1),
+                    nn.LeakyReLU())
+            )
+            in_channels = h_dim
+
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(in_channels, in_channels,
+                          kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU())
         )
 
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(z_dim, dim*8, 2, 1, 0),
-            nn.BatchNorm2d(dim*8),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim*8, dim*4, 4, 2, 1),
-            nn.BatchNorm2d(dim*4),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim*4, dim*2, 4, 2, 1),
-            nn.BatchNorm2d(dim*2),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim*2, dim, 4, 2, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
-            nn.Tanh()
+        for _ in range(6):
+            modules.append(ResidualLayer(in_channels, in_channels))
+        modules.append(nn.LeakyReLU())
+
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(in_channels, embedding_dim,
+                          kernel_size=1, stride=1),
+                nn.LeakyReLU())
         )
+
+        self.encoder = nn.Sequential(*modules)
+
+        self.vq_layer = VectorQuantizer(num_embeddings,
+                                        embedding_dim,
+                                        self.beta)
+
+        # Build Decoder
+        modules = []
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(embedding_dim,
+                          hidden_dims[-1],
+                          kernel_size=3,
+                          stride=1,
+                          padding=1),
+                nn.LeakyReLU())
+        )
+
+        for _ in range(6):
+            modules.append(ResidualLayer(hidden_dims[-1], hidden_dims[-1]))
+
+        modules.append(nn.LeakyReLU())
+
+        hidden_dims.reverse()
+
+        for i in range(len(hidden_dims) - 1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(hidden_dims[i],
+                                       hidden_dims[i + 1],
+                                       kernel_size=4,
+                                       stride=2,
+                                       padding=1),
+                    nn.LeakyReLU())
+            )
+
+        modules.append(
+            nn.Sequential(
+                nn.ConvTranspose2d(hidden_dims[-1],
+                                   out_channels=3,
+                                   kernel_size=4,
+                                   stride=2, padding=1),
+                nn.Tanh()))
+
+        self.decoder = nn.Sequential(*modules)
         
-#         self.encoder = nn.DataParallel(self.encoder)
-#         self.decoder = nn.DataParallel(self.decoder)
-            
         self.best_is = 0
         self.best_fid = 0
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3, weight_decay=1e-5)
 
-    def forward(self, x): 
-        mu, logvar = self.encoder(x).chunk(2, dim=1)
-        q_z_x = Normal(mu, logvar.mul(.5).exp())
-        p_z = Normal(torch.zeros_like(mu), torch.ones_like(logvar))
-        kl_div = kl_divergence(q_z_x, p_z).sum(1).mean()
+    def encode(self, input):
+        """
+        Encodes the input by passing through the encoder network
+        and returns the latent codes.
+        :param input: (Tensor) Input tensor to encoder [N x C x H x W]
+        :return: (Tensor) List of latent codes
+        """
+        result = self.encoder(input)
+        return [result]
 
-        x_tilde = self.decoder(q_z_x.rsample())
-        return x_tilde, kl_div
-    
+    def decode(self, z):
+        """
+        Maps the given latent codes
+        onto the image space.
+        :param z: (Tensor) [B x D x H x W]
+        :return: (Tensor) [B x C x H x W]
+        """
+        result = self.decoder(z)
+        return result
+
+    def forward(self, input, **kwargs):
+        encoding = self.encode(input)[0]
+        quantized_inputs, vq_loss = self.vq_layer(encoding)
+        return [self.decode(quantized_inputs), input, vq_loss]
+
     def log(self, message):
         print(message)
         fh = open(path + "/train.log", 'a+')
@@ -126,10 +227,8 @@ class vae(nn.Module):
         num_batches = int(50000 / batch_size)
         for batch in range(num_batches):
             with torch.no_grad():
-                mu = torch.randn(batch_size, self.z_dim, 1, 1, device=self.device)
-                logvar = torch.randn(batch_size, self.z_dim, 1, 1, device=self.device)
-                q_z_x = Normal(mu, logvar.mul(.5).exp())
-                gen = self.decoder(q_z_x.rsample())
+                z = torch.randn(batch_size, self.embedding_dim, 2, 2).cuda()
+                gen = self.decode(z)
                 gen = gen * 0.5 + 0.5
                 gen = gen * 255.0
                 gen = gen.cpu().numpy().astype(np.uint8)
@@ -238,7 +337,7 @@ class vae(nn.Module):
         for pruning_iter in range(0, number_of_iterations):
             self.log("Running pruning iteration {}".format(pruning_iter))
             self.__init__(input_dim = nc, dim = hidden_size, z_dim = latent_size)
-            self = self.to(self.device)
+            self = self.cuda()
             trained_model = trained_original_model_state
             if pruning_iter != 0:
                 trained_model = path + "/"+ "end_of_" + str(pruning_iter - 1) + '.pth'
@@ -255,7 +354,7 @@ class vae(nn.Module):
             
             torch.save(self.state_dict(), path + "/"+ "end_of_" + str(pruning_iter) + '.pth')
             
-            sample, kl = self.forward(test_input.to(self.device))
+            sample, kl = self.forward(test_input.cuda())
             save_image(sample * 0.5 + 0.5, path + '/image_' + str(pruning_iter) + '.png')
             torch.cuda.empty_cache()
             
@@ -269,7 +368,7 @@ class vae(nn.Module):
                 model[name].data.mul_(self.masks[name])
         self.load_state_dict(model)
     
-    def train(self, prune, init_state = None, init_with_old = True, prune_encoder = True, prune_decoder = True):
+    def train(self, prune, init_state, init_with_old, prune_encoder = True, prune_decoder = True):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
         if not prune:
             self.save(path + '/before_train.pth')
@@ -282,16 +381,11 @@ class vae(nn.Module):
         for epoch in range(num_epochs):
             for data in dataloader:
                 x, _ = data
-                x = x.to(self.device)
+                x = x.cuda()
                 
-                x_tilde, kl_d = self.forward(x)
-                loss_recons = F.mse_loss(x_tilde, x, size_average=False) / x.size(0)
-                loss = loss_recons + 4 * kl_d
-
-                nll = -Normal(x_tilde, torch.ones_like(x_tilde)).log_prob(x)
-                log_px = nll.mean().item() - np.log(128) + kl_d.item()
-                log_px /= np.log(2)
-
+                x_tilde, _, vq_loss = self.forward(x)
+                loss_recons = F.mse_loss(x_tilde, x)
+                loss = loss_recons + vq_loss
                 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -300,67 +394,17 @@ class vae(nn.Module):
                     self.mask(prune_encoder = prune_encoder,
                               prune_decoder = prune_decoder)
 
-            self.log("Epoch[{}/{}] Loss: {} log_px:{} Recon: {} KL: {}".format(epoch+1, 
-                                                                                      num_epochs, 
-                                                                                      loss.data.item(), 
-                                                                                      log_px,
-                                                                                      loss_recons.data.item(), 
-                                                                                      kl_d.data.item()))
+            self.log("Epoch[{}/{}] Loss: {} Recon: {} VQLoss: {}".format(epoch+1, 
+                                                                  num_epochs, 
+                                                                  loss.data.item(), 
+                                                                  loss_recons.data.item(), 
+                                                                  vq_loss.data.item()))
             if epoch > 0 and (epoch % 20 == 0 or epoch == num_epochs - 1):
                 self.compute_inception_fid()
-                sample, kl = self.forward(test_input.to(self.device))
+                sample, _, _ = self.forward(test_input.cuda())
                 save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
             
         torch.save(self.state_dict(), path + '/vae.pth')
-
-# batch_size = 128
-# img_transform = transforms.Compose([
-#                 transforms.Resize(32),
-#                 transforms.RandomCrop(32),
-#                 #transforms.Grayscale(3),
-#                 transforms.ToTensor(),
-#                 transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
-#             ])
-
-# dataset = datasets.ImageFolder("../datasets/celeba_short", transform=img_transform)
-# dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-# dataloader1 = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-# test_input, classes = next(iter(dataloader1))
-
-# inception_tf.initialize_inception()
-
-# inception_cache_path = './inception_cache/celeba'
-# path = 'celeba_test'
-# num_epochs = 100
-
-# for i in range(19):
-#     gan = torch.load("../gan-pytorch/celeba_iter_1/end_of_"+str(i)+".pth")
-#     vae = vae(input_dim = 3, dim = 64, z_dim = 32)
-#     vae = vae.to(vae.device)
-#     model = vae.state_dict()
-#     for name in gan:
-#         if 'D.' in name and '9' not in name:
-#             vae_layer = name.replace('D', 'encoder')
-#         if 'G.' in name and '3' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('3', '6')
-#         if 'G.' in name and '4' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('4', '7')
-#         if 'G.' in name and '6' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('6', '9')
-#         if 'G.' in name and '7' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('7', '10')
-#         if 'G.' in name and '9' in name:
-#             vae_layer = name.replace('G', 'decoder')
-#             vae_layer = vae_layer.replace('9', '12')  
-
-#         model[vae_layer] = gan[name]
-
-#     vae.load_state_dict(model)
-#     vae.train(prune = False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch VAE')
@@ -427,7 +471,7 @@ if __name__ == "__main__":
     img_transform = transforms.Compose([
                 transforms.Resize(image_size),
                 transforms.RandomCrop(image_size),
-                #transforms.Grayscale(3),
+                transforms.Grayscale(3),
                 transforms.ToTensor(),
                 transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
             ])
@@ -444,7 +488,7 @@ if __name__ == "__main__":
 
     nc = 3
 
-    test_input, classes = next(iter(dataloader1))
+    test_input, classes = next(iter(dataloader1)) 
     print(classes)
 
 
@@ -454,16 +498,15 @@ if __name__ == "__main__":
 
     inception_tf.initialize_inception()
 
-    model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
-    model = model.to(model.device)
+    model = VQVAE().cuda()
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
     model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
 
-#     model.iterative_prune(init_state = init_state, 
-#                         trained_original_model_state = trained_original_model_state, 
-#                         number_of_iterations = 20, 
-#                         percent = 20, 
-#                         init_with_old = init_with_old,
-#                         prune_encoder = prune_encoder,
-#                         prune_decoder = prune_decoder)
+    # model.iterative_prune(init_state = init_state, 
+    #                     trained_original_model_state = trained_original_model_state, 
+    #                     number_of_iterations = 20, 
+    #                     percent = 20, 
+    #                     init_with_old = init_with_old,
+    #                     prune_encoder = prune_encoder,
+    #                     prune_decoder = prune_decoder)
 

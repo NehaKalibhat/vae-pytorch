@@ -182,7 +182,7 @@ class vae(nn.Module):
             masks = {}
             flat_model_weights = np.array([])
             for name in model:
-                if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                if ("encoder" in name and prune_encoder) or ("decoder" in name and "0" not in name and "1" not in name and "3" not in name and prune_decoder):
                     layer_weights = model[name].data.cpu().numpy()
                     flat_model_weights = np.concatenate((flat_model_weights, layer_weights.flatten()))
             global_threshold = np.percentile(abs(flat_model_weights), pruning_perc)
@@ -191,7 +191,7 @@ class vae(nn.Module):
             total = 0
             self.log("VAE layer-wise pruning percentages")
             for name in model:
-                if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+                if ("encoder" in name and prune_encoder) or ("decoder" in name and "0" not in name and "1" not in name and "3" not in name and prune_decoder):
                     threshold = global_threshold
                     if layer_wise:
                         layer_weights = model[name].data.cpu().numpy()
@@ -265,7 +265,7 @@ class vae(nn.Module):
     def mask(self, prune_encoder = True, prune_decoder = True):
         model = self.state_dict()
         for name in model:
-            if ("encoder" in name and prune_encoder) or ("decoder" in name and prune_decoder):
+            if ("encoder" in name and prune_encoder) or ("decoder" in name and "0" not in name and "1" not in name and "3" not in name and prune_decoder):
                 model[name].data.mul_(self.masks[name])
         self.load_state_dict(model)
     
@@ -299,6 +299,8 @@ class vae(nn.Module):
                 if prune:
                     self.mask(prune_encoder = prune_encoder,
                               prune_decoder = prune_decoder)
+                    
+                torch.cuda.empty_cache()
 
             self.log("Epoch[{}/{}] Loss: {} log_px:{} Recon: {} KL: {}".format(epoch+1, 
                                                                                       num_epochs, 
@@ -306,10 +308,10 @@ class vae(nn.Module):
                                                                                       log_px,
                                                                                       loss_recons.data.item(), 
                                                                                       kl_d.data.item()))
-            if epoch > 0 and (epoch % 20 == 0 or epoch == num_epochs - 1):
+            if epoch > 0 and epoch == num_epochs - 1:
                 self.compute_inception_fid()
-                sample, kl = self.forward(test_input.to(self.device))
-                save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
+#                 sample, kl = self.forward(test_input.to(self.device))
+#                 save_image(sample*0.5+0.5, path + '/image_{}.png'.format(epoch))    
             
         torch.save(self.state_dict(), path + '/vae.pth')
 
@@ -457,13 +459,13 @@ if __name__ == "__main__":
     model = vae(input_dim = nc, dim = hidden_size, z_dim = latent_size)
     model = model.to(model.device)
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
-    model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
+    #model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
 
-#     model.iterative_prune(init_state = init_state, 
-#                         trained_original_model_state = trained_original_model_state, 
-#                         number_of_iterations = 20, 
-#                         percent = 20, 
-#                         init_with_old = init_with_old,
-#                         prune_encoder = prune_encoder,
-#                         prune_decoder = prune_decoder)
+    model.iterative_prune(init_state = init_state, 
+                        trained_original_model_state = trained_original_model_state, 
+                        number_of_iterations = 20, 
+                        percent = 20, 
+                        init_with_old = init_with_old,
+                        prune_encoder = prune_encoder,
+                        prune_decoder = prune_decoder)
 
